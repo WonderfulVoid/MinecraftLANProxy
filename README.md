@@ -23,13 +23,17 @@ host MACLANProxy is running on) can be opened up in a router firewall.
 
 Usage
 --------------
-$ ./mclanproxy [-v] [-i <ifname>]
+$ ./mclanproxy [-v] [-i {ifname}]
 - -v verbose
-- -i <ifname>     Specify interface to listen for announcements on
+- -i {ifname}     Specify interface to listen for announcements on
+
+The public port (TCP port 12345) must be forwarded in the router firewall to the host running MCLANProxy. Remote Minecraft clients should connect to port 12345 of the router's public IP address.
+
+If the remote Minecraft client immediately disconnects from the proxy (or from the LAN world server), this may depend on the client and server being of different incompatible versions. This happens too often when you run mods that require old Minecraft versions.
 
 Limitations
 --------------
-- Interface to listen for multicast announcements on must be specified unless it matches hardcoded default ("eth0"). Ideally a suitable Ethernet-like interface should automatically be found.
+- Must specify interface to listen for multicast announcements on unless it matches hardcoded default ("eth0"). Ideally a suitable Ethernet-like interface should automatically be found.
 - The public port for remote hosts is hardcoded to 12345.
 - MCLANProxy doesn't stop accepting remote connections when the LAN world announcement ceases.
 
