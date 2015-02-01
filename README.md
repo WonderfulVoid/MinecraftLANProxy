@@ -14,7 +14,7 @@ join her Minecraft worlds even when not on the same LAN.
 
 Usage
 --------------
-$ ./mclanproxy [-i {ifname}] [-p {port}] [-v]
+$ ./mclanproxy [-i {ifname}] [-p {port}] [-v] [-V]
 - -i {ifname}     Interface to listen for announcements on
 - -p {port}       Public port number
 - -v verbose
@@ -27,16 +27,16 @@ If the remote Minecraft client immediately disconnects from the proxy (or from t
 Limitations
 --------------
 - Must specify interface to listen for multicast announcements on unless it matches hardcoded default ("eth0"). Ideally a suitable Ethernet-like interface should automatically be found.
-- MCLANProxy doesn't stop accepting remote connections when the LAN world announcement ceases.
+- Only supports one LAN world at a time.
 
 Design
 --------------
-MCLANProxy listens for Minecraft's LAN world announcements (on IP multicast
-address 224.0.2.60 UDP port 4445). When a LAN world has been detected, MCLANProxy accepts
-remote TCP connections on the public port. A corresponding connection to the LAN
-world is created and data is forwarded between the remote host and the LAN world
-in both directions. The public port (together with the IP address of the
-host MACLANProxy is running on) can be opened up in a router firewall.
+MCLANProxy listens for Minecraft's LAN world announcements on IP multicast
+address 224.0.2.60 UDP port 4445. When a LAN world has been detected,
+MCLANProxy accepts TCP connections on the public port from remote Minecraft
+clients. A proxy process is forked for each remote client.
+A corresponding connection to the LAN world is created and data is forwarded
+in both directions between the remote host and the LAN world.
 
 Final Words
 --------------

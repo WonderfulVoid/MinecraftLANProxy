@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 //Default interface to listen for announcements on
@@ -29,8 +31,10 @@
 #define BUFSIZE 8192
 //Size of buffer for annoucement
 #define ANNOUNCEMENT_BUFSIZE 256
+//Timeout (in seconds) for LAN server supervision
+#define MCLAN_TIMEOUT 5
 
-static uint16_t verbose;
+static int verbose;
 
 //Return interface IP address in network byte order
 static uint32_t get_ip_addr(const char *ifname)
@@ -81,16 +85,16 @@ static void set_nonblock(int sd)
 
 struct buffer
 {
-    char buf[BUFSIZE];
+    uint64_t accumulated;
     uint16_t offset, length;
-    uint32_t accumulated;
+    char buf[BUFSIZE];
 };
 
 static void print_error(const char *peer)
 {
     if (verbose)
     {
-	printf("Poll error on %s socket\n", peer);
+	printf("%d: error on %s socket\n", getpid(), peer);
     }
 }
 
@@ -100,32 +104,30 @@ static bool read_socket(int sd, struct buffer *buf, const char *peer)
     int rc = read(sd, buf->buf, sizeof buf->buf);
     if (rc < 0)
     {
-	if (errno != EAGAIN)
+	if (errno == EAGAIN)
 	{
-	    perror("read"), exit(EXIT_FAILURE);
+	    return true;//not EOF
 	}
-	return true;
+	perror("read"), exit(EXIT_FAILURE);
     }
     else if (rc != 0)
     {
-//	printf("Read %u bytes from %s\n", rc, peer);
 	buf->length = rc;
 	buf->offset = 0;
-	return true;
+	return true;//not EOF
     }
-    else
+    else//rc == 0
     {
 	if (verbose)
 	{
-	    printf("EOF on %s socket\n", peer);
+	    printf("%d: EOF on %s socket\n", getpid(), peer);
 	}
-	return false;
+	return false;//EOF
     }
 }
 
-static void write_socket(struct buffer *buf, int sd, const char *peer)
+static void write_socket(struct buffer *buf, int sd)
 {
-    (void)peer;
     assert(buf->length != 0);
     int rc = write(sd, buf->buf + buf->offset, buf->length);
     if (rc < 0)
@@ -137,31 +139,49 @@ static void write_socket(struct buffer *buf, int sd, const char *peer)
     }
     else if (rc != 0)
     {
-//	printf("Wrote %u bytes to %s\n", rc, peer);
 	buf->offset += rc;
 	buf->length -= rc;
 	buf->accumulated += rc;
     }
 }
 
-static void print_stats(struct buffer *buf, const char *direction)
+static void print_stats(struct buffer *buf,
+			unsigned secs,
+			const char *direction)
 {
     if (verbose)
     {
-	printf("%s: %u bytes transferred\n", direction, buf->accumulated);
+	pid_t pid = getpid();
+	if (secs != 0)
+	{
+	    const char *metric = "";
+	    unsigned rate = buf->accumulated / secs;
+	    if (rate > 10000)
+	    {
+		rate /= 1000;
+		metric = "K";
+	    }
+	    printf("%d: %s: %"PRIu64" bytes transferred, %u %sbytes/s\n",
+		    pid, direction, buf->accumulated, rate, metric);
+	}
+	else
+	{
+	    printf("%d: %s: %"PRIu64" bytes transferred\n",
+		    pid, direction, buf->accumulated);
+	}
     }
 }
 
 static void layer7_splice(int remote_sd, int mclan_sd)
 {
+    time_t start = time(NULL);
+
     set_nonblock(remote_sd);
     set_nonblock(mclan_sd);
 
     struct buffer r2m, m2r;
-    r2m.offset = 0;
-    r2m.length = 0;
-    m2r.offset = 0;
-    m2r.length = 0;
+    memset(&r2m, 0, sizeof r2m);
+    memset(&m2r, 0, sizeof m2r);
 
     bool error;
     for (;;)
@@ -206,13 +226,13 @@ static void layer7_splice(int remote_sd, int mclan_sd)
 	{
 	    print_error("remote");
 	    error = true;
-	    goto done;
+	    goto cleanup;
 	}
 	if ((pfd[MIDX].revents & POLLERR) != 0)
 	{
 	    print_error("mclan");
 	    error = true;
-	    goto done;
+	    goto cleanup;
 	}
 	if ((pfd[RIDX].revents & POLLIN) != 0)
 	{
@@ -220,7 +240,7 @@ static void layer7_splice(int remote_sd, int mclan_sd)
 	    if (!read_socket(remote_sd, &r2m, "remote"))
 	    {
 		error = false;
-		goto done;
+		goto cleanup;
 	    }
 	}
 	if ((pfd[MIDX].revents & POLLIN) != 0)
@@ -229,58 +249,111 @@ static void layer7_splice(int remote_sd, int mclan_sd)
 	    if (!read_socket(mclan_sd, &m2r, "mclan"))
 	    {
 		error = false;
-		goto done;
+		goto cleanup;
 	    }
 	}
 	if ((pfd[RIDX].revents & POLLOUT) != 0)
 	{
 	    //Write to remote-socket from minecraft-to-remote-buffer
-	    write_socket(&m2r, remote_sd, "remote");
+	    write_socket(&m2r, remote_sd);
 	}
 	if ((pfd[MIDX].revents & POLLOUT) != 0)
 	{
 	    //Write to minecraft-socket from remote-to-minecraft-buffer
-	    write_socket(&r2m, mclan_sd, "mclan");
+	    write_socket(&r2m, mclan_sd);
 	}
     }
-done:
-    print_stats(&r2m, "remote-to-mclan");
-    print_stats(&m2r, "mclan-to-remote");
+cleanup: (void)0;//Need a statement to make compiler happy
+    unsigned secs = time(NULL) - start;
+    pid_t pid = getpid();
+    if (verbose)
+    {
+	unsigned hours = secs / 3600;
+	unsigned mins = (secs / 60) % 60;
+	printf("%d: Session lasted %02u:%02u:%02u hhmmss\n",
+		pid, hours, mins, secs % 60);
+    }
+    print_stats(&r2m, secs, "remote-to-mclan");
+    print_stats(&m2r, secs , "mclan-to-remote");
     (void)close(remote_sd);
     (void)close(mclan_sd);
-    if (verbose > 1)
-    {
-	printf("<%d> terminating\n", getpid());
-    }
     exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
-static pid_t fork_proxy(int remote_sd, int mclan_sd)
+static void fork_proxy(const struct sockaddr_in *sin_rem,
+		       int remote_sd,
+		       const struct sockaddr_in *mc_addr)
 {
     pid_t pid;
     pid = fork();
-    if (pid == 0)
+    if (pid == -1)
+    {
+	//Fork failed
+	if (verbose)
+	{
+	    printf("Failed to fork proxy (errno %d) for remote %s:%u\n",
+		    errno,
+		    inet_ntoa(sin_rem->sin_addr), ntohs(sin_rem->sin_port));
+	}
+	//Continue execution, better luck next time
+    }
+    else if (pid == 0)
     {
 	//child process
-	if (verbose > 1)
+	if (verbose)
 	{
-	    printf("Proxy process pid %d\n", getpid());
+	    printf("%d: Proxy forked for remote %s:%u\n",
+		    getpid(),
+		    inet_ntoa(sin_rem->sin_addr), ntohs(sin_rem->sin_port));
 	}
+
+	//Close all unused descriptors
+	//Ignore stdin/stdout/stderr and remote_sd
+	int desc;
+	for (desc = 3; desc < remote_sd; desc++)
+	{
+	    (void)close(desc);
+	}
+
+	//Create a socket for connecting to Minecraft server
+	int mclan_sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (mclan_sd < 0)
+	{
+	    perror("socket"), exit(EXIT_FAILURE);
+	}
+
+	//Connect to Minecraft server
+	if (connect(mclan_sd, (struct sockaddr *)mc_addr, sizeof *mc_addr) < 0)
+	{
+	    //Ignore a number of non-fatal error codes
+	    if (errno == ETIMEDOUT ||
+		    errno == ECONNRESET ||
+		    errno == ECONNREFUSED ||
+		    errno == EHOSTDOWN ||
+		    errno == EHOSTUNREACH ||
+		    errno == ENETUNREACH)
+	    {
+		//Non-fatal error
+		if (verbose)
+		{
+		    printf("%d: Failed to connect to %s:%u\n",
+			    getpid(),
+			    inet_ntoa(mc_addr->sin_addr),
+			    ntohs(mc_addr->sin_port));
+		}
+		exit(EXIT_FAILURE);
+	    }
+	    perror("connect"), exit(EXIT_FAILURE);
+	}
+	if (verbose)
+	{
+	    printf("%d: Connected to Minecraft LAN server\n", getpid());
+	}
+
 	layer7_splice(remote_sd, mclan_sd);
 	exit(EXIT_SUCCESS);
     }
-    else if (pid != -1)
-    {
-	//parent process
-	return pid;
-    }
-    else
-    {
-	//Print a non-fatal error message
-	perror("fork");
-	//We continue execution
-	return -1;
-    }
+    //else parent process
 }
 
 static bool read_message(int announce_sd,
@@ -335,7 +408,7 @@ static bool read_message(int announce_sd,
 	}
 	//Else message truncated, ignore it
     }
-    //Else not an announcement
+    //Else not a Minecraft LAN world announcement
     return false;
 }
 
@@ -364,6 +437,7 @@ static int create_accept_socket(uint16_t public_port)
 	perror("bind"), exit(EXIT_FAILURE);
     }
 
+    //Set max number of enqueued connection requests
     if (listen(accept_sd, 5) < 0)
     {
 	perror("listen"), exit(EXIT_FAILURE);
@@ -390,49 +464,10 @@ static void create_proxy(int accept_sd,
     {
 	perror("accept"), exit(EXIT_FAILURE);
     }
-    if (verbose)
-    {
-	printf("Remote: %s:%u\n", inet_ntoa(sin_rem.sin_addr),
-		ntohs(sin_rem.sin_port));
-    }
 
-    //Create a socket for connecting to Minecraft server
-    int mclan_sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (mclan_sd < 0)
-    {
-	perror("socket"), exit(EXIT_FAILURE);
-    }
+    fork_proxy(&sin_rem, rem_sd, mc_addr);
 
-    //Connect to Minecraft server
-    if (connect(mclan_sd, (struct sockaddr *)mc_addr, sizeof *mc_addr) < 0)
-    {
-	//Ignore a number of non-fatal error codes
-	if (errno == ETIMEDOUT ||
-	    errno == ECONNRESET ||
-	    errno == ECONNREFUSED ||
-	    errno == EHOSTDOWN ||
-	    errno == EHOSTUNREACH ||
-	    errno == ENETUNREACH)
-	{
-	    //Non-fatal error
-	    goto cleanup;
-	}
-	//Treat remaining errors as fatal
-	perror("connect"), exit(EXIT_FAILURE);
-    }
-    if (verbose)
-    {
-	printf("Connected to Minecraft LAN server\n");
-    }
-
-    fork_proxy(rem_sd, mclan_sd);
-
-cleanup:
     if (close(rem_sd) != 0)
-    {
-	perror("close"), exit(EXIT_FAILURE);
-    }
-    if (close(mclan_sd) != 0)
     {
 	perror("close"), exit(EXIT_FAILURE);
     }
@@ -446,6 +481,23 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 	perror("socket"), exit(EXIT_FAILURE);
     }
 
+    int reuseaddr = 1;
+    if (setsockopt(announce_sd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
+		   sizeof reuseaddr) < 0)
+    {
+	perror("setsockopt(SO_REUSEADDR)"), exit(EXIT_FAILURE);
+    }
+
+    //Listen on the Minecraft announcement multicast IP address
+    struct ip_mreq multi;
+    multi.imr_multiaddr.s_addr = inet_addr(MINECRAFT_ANNOUNCE);
+    multi.imr_interface.s_addr = get_ip_addr(ifname);//TODO use INADDR_ANY?
+    if (setsockopt(announce_sd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+		   &multi, sizeof multi) < 0)
+    {
+	perror("setsockopt(IP_ADD_MEMBERSHIP)"), exit(EXIT_FAILURE);
+    }
+
     //Bind socket to Minecraft announcement port
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof sin);
@@ -457,23 +509,12 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 	perror("bind"), exit(EXIT_FAILURE);
     }
 
-    //Listen on the Minecraft announcement multicast IP address
-    //TODO do this before binding to the port above?
-    struct ip_mreq multi;
-    multi.imr_multiaddr.s_addr = inet_addr(MINECRAFT_ANNOUNCE);
-    multi.imr_interface.s_addr = get_ip_addr(ifname);
-    if (setsockopt(announce_sd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-		   &multi, sizeof multi) < 0)
-    {
-	perror("setsockopt(IP_ADD_MEMBERSHIP)"), exit(EXIT_FAILURE);
-    }
-
     int accept_sd = -1;//Invalid descriptor
-    struct sockaddr_in mc_new, mc_cur;
-    mc_new.sin_addr.s_addr = 0;//Invalid IP address
-    mc_new.sin_port = 0;
-    mc_cur.sin_addr.s_addr = 0;//Invalid IP address
-    mc_cur.sin_port = 0;
+    //Last time we heard from LAN server
+    time_t last = (time_t)-1;
+    //Address of LAN server
+    struct sockaddr_in mc_cur;
+    memset(&mc_cur, 0, sizeof mc_cur);//Invalid address
     for (;;)
     {
 	struct pollfd pfd[2];
@@ -484,18 +525,55 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 	pfd[1].events = POLLIN;
 	pfd[1].revents = 0;
 	//Poll announcement socket, poll accept socket if valid
-	//TODO add timeout
-	int rc = poll(pfd, accept_sd != -1 ? 2 : 1, -1);
+	int rc;
+	if (accept_sd == -1)
+	{
+	    //No LAN server known, block until we receive an announcement
+	    rc = poll(pfd, 1, -1/*No timeout*/);
+	}
+	else
+	{
+	    //LAN server known, block with timeout so we can supervise it
+	    assert(last != (time_t)-1);
+	    rc = poll(pfd, 2, 2000/*timeout in milliseconds*/);
+	}
 	if (rc < 0)
 	{
 	    perror("poll"), exit(EXIT_FAILURE);
 	}
+	else if (rc == 0)
+	{
+	    //Timeout
+	    assert(last != (time_t)-1);
+	    assert(accept_sd != -1);
+	    time_t now = time(NULL);
+	    if (now - last >= MCLAN_TIMEOUT)
+	    {
+		//No announcement for N seconds
+		if (verbose)
+		{
+		    printf("Lost contact with Minecraft LAN server\n");
+		}
+		//Stop accepting connections
+		if (close(accept_sd) < 0)
+		{
+		    perror("close"), exit(EXIT_FAILURE);
+		}
+		accept_sd = -1;
+		//Invalidate current address
+		memset(&mc_cur, 0, sizeof mc_cur);
+	    }
+	    //Skip checking revents
+	    continue;
+	}
 	//Check announcement socket
 	if ((pfd[0].revents & POLLIN) != 0)
 	{
+	    struct sockaddr_in mc_new;
 	    //Data on announcement socket
 	    if (read_message(announce_sd, &mc_new))
 	    {
+		//Found a valid announcement
 		if (mc_new.sin_addr.s_addr != mc_cur.sin_addr.s_addr ||
 		    mc_new.sin_port != mc_cur.sin_port)
 		{
@@ -519,14 +597,16 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 			mc_cur = mc_new;
 		    }
 		}
-		//Else same address as previous
+		//Else we already have this address
+		//Save last time we saw it
+		last = time(NULL);
 	    }
 	    //Else not a proper announcement
 	}
-	//Check accept socket, data to read => connection waiting
+	//Check accept socket
 	if ((pfd[1].revents & POLLIN) != 0)
 	{
-	    //Connection on accept socket
+	    //Data to read => connection waiting on accept socket
 	    create_proxy(accept_sd, &mc_cur);
 	}
     }
