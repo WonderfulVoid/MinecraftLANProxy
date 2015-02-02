@@ -21,53 +21,25 @@
 #include <time.h>
 #include <unistd.h>
 
-//Default interface to listen for announcements on
-#define DEFAULT_IF "eth0" //TODO find automatically?
 //Multicast address for Minecraft LAN world announcements
-#define MINECRAFT_ANNOUNCE "224.0.2.60"
-//Default public port of proxy
-#define DEFAULT_PORT 12345
+#define ANNOUNCE_ADDR "224.0.2.60"
+
+//UDP port number for Minecraft LAN world announcements
+#define ANNOUNCE_PORT 4445
+
+//Default public port for remote connections
+#define PUBLIC_PORT 12345
+
 //Size of splicing buffer
 #define BUFSIZE 8192
-//Size of buffer for annoucement
+
+//Announcement message buffer size (message contains name of LAN world)
 #define ANNOUNCEMENT_BUFSIZE 256
+
 //Timeout (in seconds) for LAN server supervision
 #define MCLAN_TIMEOUT 5
 
 static int verbose;
-
-//Return interface IP address in network byte order
-static uint32_t get_ip_addr(const char *ifname)
-{
-    int sd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sd < 0)
-    {
-	perror("socket"), exit(EXIT_FAILURE);
-    }
-
-    struct ifreq ifr;
-    ifr.ifr_addr.sa_family = AF_INET;
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-    int rc = ioctl(sd, SIOCGIFADDR, &ifr);
-    if (rc < 0)
-    {
-	perror("ioctl"), exit(EXIT_FAILURE);
-    }
-
-    rc = close(sd);
-    if (rc < 0)
-    {
-	perror("close"), exit(EXIT_FAILURE);
-    }
-
-    if (verbose > 1)
-    {
-	printf("Interface %s has IP address %s\n",
-	       ifname,
-	       inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
-    }
-    return ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
-}
 
 static void set_nonblock(int sd)
 {
@@ -473,7 +445,7 @@ static void create_proxy(int accept_sd,
     }
 }
 
-static void listen_for_announcement(const char *ifname, uint16_t public_port)
+static void listen_for_announcement(uint16_t public_port)
 {
     int announce_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (announce_sd < 0)
@@ -488,27 +460,28 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 	perror("setsockopt(SO_REUSEADDR)"), exit(EXIT_FAILURE);
     }
 
-    //Listen on the Minecraft announcement multicast IP address
+    //Join the Minecraft announcement IP multicast group
     struct ip_mreq multi;
-    multi.imr_multiaddr.s_addr = inet_addr(MINECRAFT_ANNOUNCE);
-    multi.imr_interface.s_addr = get_ip_addr(ifname);//TODO use INADDR_ANY?
+    multi.imr_multiaddr.s_addr = inet_addr(ANNOUNCE_ADDR);
+    multi.imr_interface.s_addr = INADDR_ANY;//Receive on any interface?
     if (setsockopt(announce_sd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
 		   &multi, sizeof multi) < 0)
     {
 	perror("setsockopt(IP_ADD_MEMBERSHIP)"), exit(EXIT_FAILURE);
     }
 
-    //Bind socket to Minecraft announcement port
+    //Bind socket to Minecraft announcement address and port
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof sin);
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = INADDR_ANY;
-    sin.sin_port = htons(4445);
+    sin.sin_addr.s_addr = inet_addr(ANNOUNCE_ADDR);
+    sin.sin_port = htons(ANNOUNCE_PORT);
     if (bind(announce_sd, (struct sockaddr *)&sin, sizeof sin) < 0)
     {
 	perror("bind"), exit(EXIT_FAILURE);
     }
 
+    //Socket to listen for remote connections on
     int accept_sd = -1;//Invalid descriptor
     //Last time we heard from LAN server
     time_t last = (time_t)-1;
@@ -614,16 +587,12 @@ static void listen_for_announcement(const char *ifname, uint16_t public_port)
 
 int main(int argc, char *argv[])
 {
-    const char *ifname = DEFAULT_IF;
-    uint16_t public_port = DEFAULT_PORT;
+    uint16_t public_port = PUBLIC_PORT;
     int c;
-    while ((c = getopt(argc, argv, "i:p:vV")) != -1)
+    while ((c = getopt(argc, argv, "p:vV")) != -1)
     {
 	switch (c)
 	{
-	    case 'i' :
-		ifname = optarg;
-		break;
 	    case 'p' :
 		public_port = (uint16_t)atoi(optarg);
 		break;
@@ -636,7 +605,6 @@ int main(int argc, char *argv[])
 	    default :
 usage :
 		fprintf(stderr, "Usage: mclanproxy <options>\n"
-			"-i <ifname>     Interface to use\n"
 			"-p <port>       Public port\n"
 			"-v              Verbose\n"
 			"-V              Extra verbose\n");
@@ -648,6 +616,6 @@ usage :
 	goto usage;
     }
 
-    listen_for_announcement(ifname, public_port);
+    listen_for_announcement(public_port);
     return 0;
 }
