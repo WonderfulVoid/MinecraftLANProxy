@@ -19,7 +19,7 @@ $ ./mclanproxy [-p {port}] [-v] [-V]
 - -v verbose
 - -V extra verbose
 
-The public TCP port must be forwarded in the router firewall to the host running MCLANProxy. Remote Minecraft clients should connect to the public port (default 12345) on the router's public IP address.
+The public TCP port must be forwarded in the router firewall to the host running MCLANProxy. Remote Minecraft clients should connect to the public port (default 4446) on the router's public IP address.
 
 If the remote Minecraft client immediately disconnects from the proxy (or from the LAN world server), this may depend on the client and server being of different incompatible versions. This happens too often when you run mods that require old Minecraft versions.
 
