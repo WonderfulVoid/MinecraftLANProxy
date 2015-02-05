@@ -29,7 +29,7 @@
 #define ANNOUNCE_PORT 4445
 
 //Default public port for remote connections
-#define PUBLIC_PORT 12345
+#define PUBLIC_PORT 4446
 
 //Size of splicing buffer
 #define BUFSIZE 8192
