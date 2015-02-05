@@ -1,9 +1,9 @@
 /******************************************************************************
  * MinecraftLANProxy
- * © 2015 Ola Liljedahl
- * Proxy server for Minecraft LAN worlds to enable remote access
+ * Proxy server to enable remote access to Minecraft LAN worlds
+ * Copyright 2015 Ola Liljedahl
  *****************************************************************************/
-#define _GNU_SOURCE
+#define _GNU_SOURCE //for ip_mreq and getopt
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -192,6 +193,10 @@ static void layer7_splice(int remote_sd, int mclan_sd)
 	int rc = poll(pfd, 2, -1);
 	if (rc < 0)
 	{
+	    if (errno == EINTR || errno == ERESTART)
+	    {
+		continue;
+	    }
 	    perror("poll"), exit(EXIT_FAILURE);
 	}
 	if ((pfd[RIDX].revents & POLLERR) != 0)
@@ -242,7 +247,7 @@ cleanup: (void)0;//Need a statement to make compiler happy
     {
 	unsigned hours = secs / 3600;
 	unsigned mins = (secs / 60) % 60;
-	printf("%d: Session lasted %02u:%02u:%02u hhmmss\n",
+	printf("%d: Session duration %02u:%02u:%02u h:m:s\n",
 		pid, hours, mins, secs % 60);
     }
     print_stats(&r2m, secs, "remote-to-mclan");
@@ -320,6 +325,7 @@ static void fork_proxy(const struct sockaddr_in *sin_rem,
 	if (verbose)
 	{
 	    printf("%d: Connected to Minecraft LAN server\n", getpid());
+	    fflush(stdout);
 	}
 
 	layer7_splice(remote_sd, mclan_sd);
@@ -445,8 +451,20 @@ static void create_proxy(int accept_sd,
     }
 }
 
+static void sigchld_handler(int signum)
+{
+    (void)signum;
+    int status;
+    pid_t child_pid = waitpid(-1, &status, WNOHANG);
+    printf("Proxy %d terminated\n", child_pid);
+    fflush(stdout);
+}
+
 static void listen_for_announcement(uint16_t public_port)
 {
+    //Install signal handler for child termination
+    signal(SIGCHLD, sigchld_handler);
+
     int announce_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (announce_sd < 0)
     {
@@ -512,6 +530,10 @@ static void listen_for_announcement(uint16_t public_port)
 	}
 	if (rc < 0)
 	{
+	    if (errno == EINTR || errno == ERESTART)
+	    {
+		continue;
+	    }
 	    perror("poll"), exit(EXIT_FAILURE);
 	}
 	else if (rc == 0)
@@ -526,6 +548,7 @@ static void listen_for_announcement(uint16_t public_port)
 		if (verbose)
 		{
 		    printf("Lost contact with Minecraft LAN server\n");
+		    fflush(stdout);
 		}
 		//Stop accepting connections
 		if (close(accept_sd) < 0)
@@ -552,9 +575,10 @@ static void listen_for_announcement(uint16_t public_port)
 		{
 		    if (verbose)
 		    {
-			printf("Minecraft LAN server at %s:%u\n",
+			printf("Found Minecraft LAN server at %s:%u\n",
 				inet_ntoa(mc_new.sin_addr),
 				ntohs(mc_new.sin_port));
+			fflush(stdout);
 		    }
 		    if (accept_sd != -1)
 		    {

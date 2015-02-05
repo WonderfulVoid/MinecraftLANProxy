@@ -36,6 +36,10 @@ clients. A proxy process is forked for each remote client.
 The proxy creates a connection to the LAN server and forwards data in both
 directions between the remote host and the LAN world.
 
+Author
+--------------
+Ola Liljedahl ola.liljedahl@gmail.com
+
 Final Words
 --------------
 Possibly there is some better or simpler way of accomplishing this goal but it
