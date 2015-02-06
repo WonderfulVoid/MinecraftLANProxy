@@ -24,6 +24,7 @@ The public TCP port must be forwarded in the router firewall to the host running
 If the remote Minecraft client immediately disconnects from the proxy (or from the LAN world server), this may depend on the client and server being of different incompatible versions. This happens too often when you run mods that require old Minecraft versions.
 
 Manually start a mclanproxy server running in the background:
+
 $ nohup ./mclanproxy -v > mclanproxy.log &
 
 Limitations
