@@ -21,7 +21,7 @@ ifneq ($(DEBUG),yes)
 DEFINE += -DNDEBUG#disable assertion
 endif
 CCFLAGS += -std=c99
-CCFLAGS += -g -ggdb -W -Wall
+CCFLAGS += -g -ggdb -W -Wall -Wextra
 ifneq ($(DEBUG),yes)
 CCFLAGS += -O2
 endif

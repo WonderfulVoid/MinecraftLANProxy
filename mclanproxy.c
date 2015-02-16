@@ -53,7 +53,26 @@
 //Timeout (in seconds) for LAN server supervision
 #define MCLAN_TIMEOUT 5
 
+//Maximum number of concurrent connections
+#define MAX_CONNECTIONS 5
+
 static int verbose;
+
+static /*atomic*/ unsigned num_connections;
+
+//Note returns pointer to a statically allocated string
+static char *ctime_now(void)
+{
+    time_t now = time(NULL);
+    char *now_str = ctime(&now);
+    //Remove trailing newline
+    char *ptr = strrchr(now_str, '\n');
+    if (ptr != NULL)
+    {
+	*ptr = '\0';
+    }
+    return now_str;
+}
 
 static void set_nonblock(int sd)
 {
@@ -254,17 +273,18 @@ static void layer7_splice(int remote_sd, int mclan_sd)
 	}
     }
 cleanup: (void)0;//Need a statement to make compiler happy
-    unsigned secs = time(NULL) - start;
-    pid_t pid = getpid();
     if (verbose)
     {
+	pid_t pid = getpid();
+	printf("%d: %s\n", pid, ctime_now());
+	unsigned secs = time(NULL) - start;
 	unsigned hours = secs / 3600;
 	unsigned mins = (secs / 60) % 60;
-	printf("%d: Session duration %02u:%02u:%02u h:m:s\n",
+	printf("%d: Session duration %02uh%02um%02us\n",
 		pid, hours, mins, secs % 60);
+	print_stats(&r2m, secs, "remote-to-mclan");
+	print_stats(&m2r, secs , "mclan-to-remote");
     }
-    print_stats(&r2m, secs, "remote-to-mclan");
-    print_stats(&m2r, secs , "mclan-to-remote");
     (void)close(remote_sd);
     (void)close(mclan_sd);
     exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -292,6 +312,7 @@ static void fork_proxy(const struct sockaddr_in *sin_rem,
 	//child process
 	if (verbose)
 	{
+	    printf("%d: %s\n", getpid(), ctime_now());
 	    printf("%d: Proxy forked for remote %s:%u\n",
 		    getpid(),
 		    inet_ntoa(sin_rem->sin_addr), ntohs(sin_rem->sin_port));
@@ -344,11 +365,16 @@ static void fork_proxy(const struct sockaddr_in *sin_rem,
 	layer7_splice(remote_sd, mclan_sd);
 	exit(EXIT_SUCCESS);
     }
-    //else parent process
+    else
+    {
+	//parent process
+	//Another child process => another connection
+	(void)__atomic_add_fetch(&num_connections, 1, __ATOMIC_RELAXED);
+    }
 }
 
 static bool read_message(int announce_sd,
-	                 struct sockaddr_in *mc_sin)
+			 struct sockaddr_in *mc_sin)
 {
     char msg[ANNOUNCEMENT_BUFSIZE];
     socklen_t addr_len = sizeof *mc_sin;
@@ -469,14 +495,30 @@ static void sigchld_handler(int signum)
     (void)signum;
     int status;
     pid_t child_pid = waitpid(-1, &status, WNOHANG);
-    printf("Proxy %d terminated\n", child_pid);
-    fflush(stdout);
+    if (child_pid == -1)
+    {
+	perror("waitpid"), exit(EXIT_FAILURE);
+    }
+    if (child_pid > 0)
+    {
+	//One less child process => one less connection
+	(void)__atomic_sub_fetch(&num_connections, 1, __ATOMIC_RELAXED);
+	if (verbose)
+	{
+	    printf("Proxy %d terminated\n", child_pid);
+	    fflush(stdout);
+	}
+    }
+    //Else no child changed state or terminated
 }
 
 static void listen_for_announcement(uint16_t public_port)
 {
     //Install signal handler for child termination
-    signal(SIGCHLD, sigchld_handler);
+    if (signal(SIGCHLD, sigchld_handler) == SIG_ERR)
+    {
+	perror("signal"), exit(EXIT_FAILURE);
+    }
 
     int announce_sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (announce_sd < 0)
@@ -528,18 +570,22 @@ static void listen_for_announcement(uint16_t public_port)
 	pfd[1].fd = accept_sd;
 	pfd[1].events = POLLIN;
 	pfd[1].revents = 0;
-	//Poll announcement socket, poll accept socket if valid
 	int rc;
-	if (accept_sd == -1)
+	if (accept_sd != -1 &&
+	    __atomic_load_n(&num_connections,
+			    __ATOMIC_RELAXED) < MAX_CONNECTIONS)
 	{
-	    //No LAN server known, block until we receive an announcement
-	    rc = poll(pfd, 1, -1/*No timeout*/);
-	}
-	else
-	{
+	    //Always poll announcement socket
+	    //Poll accept socket if valid and we can serve more connections
 	    //LAN server known, block with timeout so we can supervise it
 	    assert(last != (time_t)-1);
 	    rc = poll(pfd, 2, 2000/*timeout in milliseconds*/);
+	}
+	else//Just poll announcement socket
+	{
+	    //No LAN server known, block until we receive an announcement
+	    //If a child terminates, the poll() call will be interrupted
+	    rc = poll(pfd, 1, -1/*No timeout*/);
 	}
 	if (rc < 0)
 	{
@@ -601,6 +647,11 @@ static void listen_for_announcement(uint16_t public_port)
 			}
 		    }
 		    accept_sd = create_accept_socket(public_port);
+		    //Accept socket is created even if we cannot serve more
+		    //connections. Any client attempting to connect will
+		    //timeout.
+		    //TODO create accept socket when we actually can serve
+		    //more connections, meanwhile connections should be refused.
 		    if (accept_sd != -1)
 		    {
 			//Make new LAN server current
